@@ -9,6 +9,64 @@ const { validate } = require('../middleware/validator');
 const { validateStrongPassword } = require('../utils/validationHelpers');
 const jwt = require('jsonwebtoken');
 
+// POST /auth/signup - Public user registration (no admin required)
+router.post('/signup', async (req, res, next) => {
+  const connection = await db.getConnection();
+  try {
+    const { username, email, password } = req.body;
+
+    // Validate inputs
+    if (!username || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username, email, and password are required'
+      });
+    }
+
+    // Check if user exists
+    const [existing] = await connection.query(
+      'SELECT id FROM users WHERE username = ? OR email = ?',
+      [username, email]
+    );
+
+    if (existing.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message: 'Username or email already exists'
+      });
+    }
+
+    // Hash password
+    const hashedPassword = await hashPassword(password);
+
+    // Insert user with pending approval status
+    const [result] = await connection.query(
+      'INSERT INTO users (username, email, password_hash, role, is_active, signup_pending_approval, signup_method) VALUES (?, ?, ?, ?, 1, 1, ?)',
+      [username, email, hashedPassword, 'viewer', 'email']
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Account created! Please wait for admin approval.',
+      data: {
+        id: result.insertId,
+        username,
+        email,
+        signup_pending_approval: true
+      }
+    });
+  } catch (error) {
+    console.error('Signup error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Registration failed',
+      error: error.message
+    });
+  } finally {
+    connection.release();
+  }
+});
+
 // POST /auth/register - Create new user (admin only)
 router.post('/register', authMiddleware, requireRole('admin'), validate('register'), async (req, res, next) => {
   const connection = await db.getConnection();

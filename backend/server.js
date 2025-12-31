@@ -50,6 +50,7 @@ try {
 }
 
 // Auth routes (NO authentication required)
+app.use('/auth', require('./routes/google-auth'));
 app.use('/auth', require('./routes/auth'));
 
 // Audit logging middleware for POST, PUT, DELETE requests

@@ -191,13 +191,12 @@ class PerformanceService {
         m.manufacturer,
         COALESCE(SUM(mb.stock), 0) as total_stock,
         m.min_stock,
-        m.category,
         MIN(mb.expiry) as nearest_expiry,
         DATEDIFF(MIN(mb.expiry), CURDATE()) as days_to_expiry
       FROM medicines m
       LEFT JOIN medicine_batches mb ON m.id = mb.medicine_id
-      WHERE m.active = 1
-      GROUP BY m.id, m.name, m.manufacturer, m.min_stock, m.category
+      WHERE m.is_active = TRUE
+      GROUP BY m.id, m.name, m.manufacturer, m.min_stock
       HAVING total_stock <= COALESCE(m.min_stock, 5)
       ORDER BY total_stock ASC
       LIMIT ?
