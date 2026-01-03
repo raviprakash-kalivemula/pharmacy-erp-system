@@ -13,6 +13,7 @@ const tokenService = require('../services/tokenService');
 const googleOAuthService = require('../services/googleOAuthService');
 const { googleOAuthLimiter } = require('../middleware/rateLimiter');
 const { AppError } = require('../middleware/errorHandler');
+const otpService = require('../services/otpService');
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
@@ -24,7 +25,7 @@ const verifyToken = (token) => {
 const authMiddleware = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
-    
+
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({
         success: false,
@@ -81,9 +82,13 @@ router.post('/google/callback', googleOAuthLimiter, async (req, res, next) => {
       throw new AppError('Invalid Google token', 401, 'INVALID_TOKEN');
     }
 
-    // Find or create user
-    const result = await googleOAuthService.findOrCreateGoogleUser(googleProfile, 'cashier');
-    const user = result.user;
+    // Find user (DO NOT CREATE YET)
+    let user = await googleOAuthService.findUserByGoogleOrEmail(googleProfile.sub, googleProfile.email);
+
+    if (!user) {
+      // User not found - return 404 to trigger signup flow in frontend
+      throw new AppError('User not found', 404, 'USER_NOT_FOUND');
+    }
 
     // Check if user is active
     if (!user.is_active) {
@@ -156,13 +161,19 @@ router.post('/google/callback', googleOAuthLimiter, async (req, res, next) => {
  * Create new user with Google OAuth (guided signup)
  * User is created with pending_approval status
  */
+
+
+// ... imports remain the same
+
+// ... code remains the same
+
 router.post('/google/register', googleOAuthLimiter, async (req, res, next) => {
   const connection = await db.getConnection();
   try {
-    const { idToken, username } = req.body;
+    const { idToken, username, otp } = req.body;
 
-    if (!idToken || !username) {
-      throw new AppError('Google token and username are required', 400, 'MISSING_FIELDS');
+    if (!idToken || !username || !otp) {
+      throw new AppError('Google token, username and verification code are required', 400, 'MISSING_FIELDS');
     }
 
     // Verify Google token
@@ -175,6 +186,12 @@ router.post('/google/register', googleOAuthLimiter, async (req, res, next) => {
       googleProfile = ticket.getPayload();
     } catch (error) {
       throw new AppError('Invalid Google token', 401, 'INVALID_TOKEN');
+    }
+
+    // Verify OTP
+    const otpValidation = await otpService.validateOTP(googleProfile.email, otp, 'signup');
+    if (!otpValidation.valid) {
+      throw new AppError(otpValidation.message, 400, 'INVALID_OTP');
     }
 
     // Check if username is already taken
@@ -197,6 +214,9 @@ router.post('/google/register', googleOAuthLimiter, async (req, res, next) => {
       throw new AppError('Email already registered', 409, 'EMAIL_EXISTS');
     }
 
+    // Mark OTP as used
+    await otpService.markOTPAsUsed(otpValidation.otpId);
+
     // Create new user with cashier role (not viewer)
     const passwordHash = await require('../services/authService').hashPassword(
       require('crypto').randomBytes(32).toString('hex')
@@ -204,18 +224,32 @@ router.post('/google/register', googleOAuthLimiter, async (req, res, next) => {
 
     const [result] = await connection.query(
       `INSERT INTO users 
-      (username, email, password_hash, role, is_active, email_verified, email_verified_at, signup_method, signup_pending_approval, google_id) 
-      VALUES (?, ?, ?, ?, 1, 1, NOW(), ?, 1, ?)`,
-      [username, googleProfile.email, passwordHash, 'cashier', 'google', googleProfile.sub]
+      (username, email, password_hash, full_name, role, is_active, email_verified, email_verified_at, signup_method, signup_pending_approval, google_id, avatar_url) 
+      VALUES (?, ?, ?, ?, ?, 1, 1, NOW(), ?, 1, ?, ?)`,
+      [
+        username,
+        googleProfile.email,
+        passwordHash,
+        googleProfile.name || username, // Use Google name or username
+        'cashier',
+        'google',
+        googleProfile.sub,
+        googleProfile.picture || null
+      ]
     );
 
     const userId = result.insertId;
 
     // Store OAuth account details
     await connection.query(
-      `INSERT INTO oauth_accounts (user_id, provider, provider_id, provider_email, picture_url, verified) 
+      `INSERT INTO oauth_accounts (user_id, provider, provider_user_id, provider_email, profile_data, is_primary) 
        VALUES (?, 'google', ?, ?, ?, 1)`,
-      [userId, googleProfile.sub, googleProfile.email, googleProfile.picture || null]
+      [
+        userId,
+        googleProfile.sub,
+        googleProfile.email,
+        JSON.stringify(googleProfile)
+      ]
     );
 
     logger.info('New Google user registered', { userId, username, email: googleProfile.email });
@@ -266,38 +300,8 @@ router.post('/google/link', authMiddleware, googleOAuthLimiter, async (req, res,
       throw new AppError('Invalid Google token', 401, 'INVALID_TOKEN');
     }
 
-    // Check if Google ID is already linked to another user
-    const [existing] = await connection.query(
-      'SELECT id FROM oauth_accounts WHERE provider = ? AND provider_id = ? AND user_id != ?',
-      ['google', googleProfile.sub, userId]
-    );
-
-    if (existing.length > 0) {
-      throw new AppError('This Google account is already linked to another user', 409, 'GOOGLE_ALREADY_LINKED');
-    }
-
-    // Check if already linked to this user
-    const [alreadyLinked] = await connection.query(
-      'SELECT id FROM oauth_accounts WHERE provider = ? AND user_id = ?',
-      ['google', userId]
-    );
-
-    if (alreadyLinked.length > 0) {
-      throw new AppError('You already have a Google account linked', 409, 'ALREADY_LINKED');
-    }
-
-    // Link the account
-    await connection.query(
-      `INSERT INTO oauth_accounts (user_id, provider, provider_id, provider_email, picture_url, verified) 
-       VALUES (?, 'google', ?, ?, ?, 1)`,
-      [userId, googleProfile.sub, googleProfile.email, googleProfile.picture || null]
-    );
-
-    // Update user's Google ID
-    await connection.query(
-      'UPDATE users SET google_id = ? WHERE id = ?',
-      [googleProfile.sub, userId]
-    );
+    // Link using service
+    await googleOAuthService.linkGoogleAccount(userId, googleProfile);
 
     logger.info('Google account linked', { userId, email: googleProfile.email });
 
